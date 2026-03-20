@@ -1,0 +1,2 @@
+﻿System,Drug Encoder,Target Encoder,Fusion,Total Params,MAE,RMSE,Pearson,Dataset
+Graph Transformer + Protein Transformer (Ours),Graph Transformer (Graphormer-style),Protein Transformer,Gated + Diff + Product,"2,515,897",0.7849,1.1685,0.7430,BindingDB 20k (Kd)
