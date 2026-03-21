@@ -1,0 +1,5 @@
+﻿model,drug_encoder,target_encoder,total_params,test_samples,mae,rmse,pearson
+MPNN_CNN_DAVIS,MPNN,CNN,2294657,2000,4.609012844839553,5.156922110168042,-0.4659607420632181
+GraphTransformer_seed42 (Ours),Graph Transformer,Protein Transformer,2515897,~2000,0.7849242091178894,1.1685376167297363,0.7430586397771701
+GraphTransformer_seed123 (Ours),Graph Transformer,Protein Transformer,2515897,~2000,0.7763711214065552,1.169023871421814,0.7528499499187321
+GraphTransformer_seed3407 (Ours),Graph Transformer,Protein Transformer,2515897,~2000,0.7524505257606506,1.0744355916976929,0.7800911523138777

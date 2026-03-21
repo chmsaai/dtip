@@ -348,11 +348,14 @@ class ProteinTransformerEncoder(nn.Module):
 # ============================================================
 
 class GraphTransformerLayer(nn.Module):
-    """Pre-norm Transformer layer that accepts a 3-D attention bias."""
+    """Pre-norm Transformer layer with manual attention to support additive
+    bias reliably across PyTorch versions (2.0 fast-path has a bug that
+    converts float attn_mask to bool, breaking additive edge biases)."""
 
     def __init__(self, d_model: int, nhead: int, ff_dim: int, dropout: float):
         super().__init__()
         self.nhead = nhead
+        self.head_dim = d_model // nhead
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -361,10 +364,28 @@ class GraphTransformerLayer(nn.Module):
             nn.Linear(ff_dim, d_model), nn.Dropout(dropout),
         )
         self.dropout = nn.Dropout(dropout)
+        self._scale = self.head_dim ** -0.5
 
     def forward(self, x, attn_bias=None, key_padding_mask=None):
         x2 = self.norm1(x)
-        x2, _ = self.self_attn(x2, x2, x2, attn_mask=attn_bias, key_padding_mask=key_padding_mask)
+        B, S, E = x2.shape
+        H, D = self.nhead, self.head_dim
+
+        qkv = F.linear(x2, self.self_attn.in_proj_weight, self.self_attn.in_proj_bias)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.view(B, S, H, D).transpose(1, 2)
+        k = k.view(B, S, H, D).transpose(1, 2)
+        v = v.view(B, S, H, D).transpose(1, 2)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self._scale
+        if attn_bias is not None:
+            attn = attn + attn_bias.view(B, H, S, S)
+        attn = F.softmax(attn, dim=-1)
+        if self.training:
+            attn = F.dropout(attn, p=self.self_attn.dropout, training=True)
+        out = torch.matmul(attn, v).transpose(1, 2).contiguous().view(B, S, E)
+        x2 = self.self_attn.out_proj(out)
+
         x = x + self.dropout(x2)
         x = x + self.ff(self.norm2(x))
         return x
@@ -402,7 +423,10 @@ class MoleculeGraphTransformerEncoder(nn.Module):
     def _build_attn_bias(self, edge_type: torch.Tensor, atom_mask: torch.Tensor) -> torch.Tensor:
         """Build [B*nhead, S, S] additive attention bias from edge type matrix.
 
-        edge_type: [B, N, N] (0..5)  —  atom-level edge types
+        Padding is folded into the bias as -inf so that key_padding_mask
+        is not needed (avoids bool/float type mismatch across PyTorch versions).
+
+        edge_type: [B, N, N] (0..5)
         atom_mask: [B, N]  float  (1=real, 0=pad)
         Returns:   [B*nhead, N+1, N+1]  float
         """
@@ -420,6 +444,31 @@ class MoleculeGraphTransformerEncoder(nn.Module):
 
         bias = self.edge_bias(full_etype)  # [B, S, S, nhead]
         bias = bias.permute(0, 3, 1, 2).reshape(B * self.nhead, S, S)
+
+        # Fold padding into bias: if column j is a padding atom, set bias to -inf
+        # so that no token attends to padding positions.
+        pad_col = torch.cat([
+            torch.zeros(B, 1, device=device),
+            1.0 - atom_mask,
+        ], dim=1)  # [B, S]  1=pad
+        pad_col_mask = (pad_col > 0.5).unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
+        pad_col_mask = pad_col_mask.expand(-1, self.nhead, S, -1)  # [B, nh, S, S]
+        pad_col_mask = pad_col_mask.reshape(B * self.nhead, S, S)
+        bias = bias.masked_fill(pad_col_mask, float("-inf"))
+
+        # Also mask padding rows attending to real atoms (keep self-loop
+        # to avoid all-inf rows which produce NaN in softmax).
+        pad_row = torch.cat([
+            torch.zeros(B, 1, device=device),
+            1.0 - atom_mask,
+        ], dim=1)  # [B, S]
+        pad_row_mask = (pad_row > 0.5).unsqueeze(1).unsqueeze(-1)  # [B, 1, S, 1]
+        pad_row_mask = pad_row_mask.expand(-1, self.nhead, -1, S)
+        pad_row_mask = pad_row_mask.reshape(B * self.nhead, S, S)
+        # Block padding rows, but keep diagonal (self-loop) to avoid NaN
+        diag = torch.eye(S, dtype=torch.bool, device=device).unsqueeze(0)
+        bias = bias.masked_fill(pad_row_mask & ~diag, float("-inf"))
+
         return bias
 
     def forward(
@@ -444,11 +493,17 @@ class MoleculeGraphTransformerEncoder(nn.Module):
 
         attn_bias = self._build_attn_bias(edge_type, atom_mask)
 
-        cls_pad = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
-        pad_mask = torch.cat([cls_pad, atom_mask < 0.5], dim=1)  # True=ignore
+        # Bool mask for padding positions: True = padding (to be zeroed).
+        # After each layer, replace padding positions with 0.0 to prevent
+        # NaN propagation (0*NaN=NaN in IEEE 754, so masked_fill is needed).
+        pad_pos = torch.cat([
+            torch.zeros(B, 1, dtype=torch.bool, device=x.device),
+            atom_mask < 0.5,
+        ], dim=1).unsqueeze(-1)  # [B, S, 1]
 
         for layer in self.layers:
-            x = layer(x, attn_bias=attn_bias, key_padding_mask=pad_mask)
+            x = layer(x, attn_bias=attn_bias, key_padding_mask=None)
+            x = x.masked_fill(pad_pos, 0.0)
 
         x = self.final_norm(x[:, 0, :])
         return self.proj(x)

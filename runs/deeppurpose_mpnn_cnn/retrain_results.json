@@ -1,0 +1,7 @@
+{
+  "model": "DeepPurpose_MPNN_CNN_retrained",
+  "total_params": 2372801,
+  "mae": 0.8482504141007122,
+  "rmse": 1.176840909924663,
+  "pearson": 0.7346273658489226
+}
